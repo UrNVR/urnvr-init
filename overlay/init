@@ -1,0 +1,128 @@
+#!/bin/sh
+mount -t devtmpfs devtmpfs /dev
+mkdir /dev/pts
+mkdir /dev/shm
+mount -a
+rm /etc/dropbear
+
+# manually set 'final' names for ethernet device
+/sbin/ip link set eth0 name enp0s1
+/sbin/ip link set eth1 name enp0s2
+
+# wait for the USB drive to show up
+counter=0
+echo -n "waiting for /dev/sda1"
+while [ ! -b /dev/sda1 ] && [ $counter -le 20 ]; do
+	echo -n "."
+	sleep 0.5
+	counter=$((counter + 1))
+done
+echo ""
+if [ -b /dev/sda1 ]; then
+# the partition is available, so mount it and load the configuration
+	mkdir /boot
+	mount /dev/sda1 /boot
+	if [ -e /boot/urnvr.conf ]; then
+		source /boot/urnvr.conf
+	fi
+	mkdir -p /boot/dropbear
+	ln -s /boot/dropbear /etc
+else
+# could not find the configuration partition, prepare for temporary dropbear key
+	echo "timed out waiting for /dev/sda1!"
+	mkdir /etc/dropbear
+	mount -t tmpfs none /etc/dropbear
+fi
+
+# try to get valid configuration settings
+ip=${ip:-192.168.1.1/24}
+interface=${interface:-enp0s1}
+release=${release:-bullseye}
+rootpass=${rootpass:-urnvr}
+setup=${setup:-0}
+case "$setup" in
+	[Yy1]* ) setup=1;;
+	[Oo][Nn]* ) setup=1;;
+	* ) setup=0;;
+esac
+forcessh=${forcessh:-0}
+case "$forcessh" in
+	[Yy1]* ) forcessh=1;;
+	[Oo][Nn]* ) forcessh=1;;
+	* ) forcessh=0;;
+esac
+
+# if there is no configuration partition, we want to always start ssh
+if [ ! -b /dev/sda1 ]; then
+	forcessh=1
+fi
+
+# without ssh, we are now done with the /boot mountpoint
+if [ $forcessh == 0 ]; then
+	umount /dev/sda1
+fi
+
+# if setup is requested and ssh is not required, start setup
+if [ $forcessh == 0 ] && [ $setup == 1 ]; then
+	# remove all partitions except for the boot one
+	for i in ${2..5}; do
+		sgdisk -d $i /dev/sda
+	done
+	# create a new rootfs partition covering the free space
+	sgdisk -n 2:: /dev/sda
+	sgdisk -t 2:8305 /dev/sda
+	sgdisk -c 2:rootfs /dev/sda
+	# reload partitions
+	partprobe /dev/sda
+	# format and mount the new partition
+	mkfs.ext4 -F /dev/sda2
+	mkdir -p /rootfs
+	mount /dev/sda2 /rootfs
+	# create a directory that we can later mount the boot partition to
+	mkdir /rootfs/boot
+	# run debootstrap to install a rootfs
+	/debootstrap/debootstrap --no-check-gpg --arch=arm64 $release /rootfs/
+	# install openssh-server in the new rootfs
+	chroot /rootfs apt update
+	chroot /rootfs apt install openssh-server
+	# set the root password
+	echo -e "$rootpass\n$rootpass" | chroot /rootfs passwd --stdin
+	# copy configuration files
+	cp /config/fstab /rootfs/etc/fstab
+	if [ -d /boot/interfaces.d ]; then
+		mv /boot/interfaces.d/* /rootfs/etc/network/interfaces.d/
+		rmdir /boot/interfaces.d
+	else
+		cp /config/interfaces.d/* /rootfs/etc/network/interfaces.d/
+	fi
+	# allow root login via ssh
+	echo "PermitRootLogin yes" >> /rootfs/etc/ssh/sshd_config
+	# set setup=0 in urnvr.conf because we are done
+	sed -i -e 's/setup=.*/setup=0/' /boot/urnvr.conf
+	# unmount the drives
+	umount /dev/sda1
+	umount /dev/sda2
+fi
+
+# if only two partitions exist on the usb drive and ssh is not required, switch to the rootfs
+if [ $forcessh == 0 ] && [ ! -b /dev/sda3 ] && [ -b /dev/sda2 ]; then
+	mkdir -p /rootfs
+	# mount everything necessary
+	mount /dev/sda2 /rootfs
+	mount /dev/sda1 /rootfs/boot
+	mount --move /sys /rootfs/sys
+	mount --move /proc /rootfs/proc
+	mount --move /dev /rootfs/dev
+	# switch to the new root
+	exec switch_root /rootfs /sbin/init
+fi
+
+# the following code will only run if root was not switched
+# set up the network interface (with static ip and ssh)
+/sbin/ip link set up $interface
+/sbin/dhcpcd $interface
+/sbin/ip addr add $ip dev $interface
+# start dropbear
+dropbear -R &
+# start a shell on the serial interface
+exec sh

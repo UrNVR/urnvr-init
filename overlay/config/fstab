@@ -1,0 +1,2 @@
+/dev/sda2 / ext4 defaults 0 1
+/dev/sda1 /boot ext4 defaults 0 1

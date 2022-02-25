@@ -1,0 +1,2 @@
+allow-hotplug enp0s1
+iface enp0s1 inet dhcp
